@@ -1,9 +1,10 @@
 import hashlib
 import hmac
+from decimal import Decimal
 
 from django.conf import settings
-from django.db import connection
-from django.db.models import Count, Sum
+from django.db.models import Count, F, Q, Sum
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 from rest_framework import status, viewsets
@@ -12,16 +13,30 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .exceptions import InsufficientStock
-from .models import Customer, Invoice, Product
+from .exceptions import (
+    InsufficientStock,
+    InvalidPaymentAmount,
+    InvoiceCancellationNotAllowed,
+    ReturnNotAllowed,
+    ReturnQuantityExceeded,
+)
+from .models import CreditNote, Customer, Invoice, Product
 from .serializers import (
+    CreateReturnSerializer,
+    CreditNoteSerializer,
     CustomerSerializer,
     InvoiceCreateSerializer,
     InvoiceSerializer,
     PaymentCreateSerializer,
     ProductSerializer,
 )
-from .services import cancel_invoice, create_invoice, record_payment
+from .services import (
+    cancel_invoice,
+    create_invoice,
+    process_return,
+    record_payment,
+    send_invoice_reminder,
+)
 from .tasks import process_gateway_payment
 
 
@@ -83,17 +98,21 @@ class InvoiceViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"])
     def payments(self, request, pk=None):
-        invoice = Invoice.objects.get(pk=pk)
+        invoice = self.get_object()
         serializer = PaymentCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        payment = record_payment(
-            invoice=invoice,
-            amount=serializer.validated_data["amount"],
-            method=serializer.validated_data["method"],
-            user=request.user,
-            gateway_ref=serializer.validated_data.get("reference", ""),
-        )
+        try:
+            payment = record_payment(
+                invoice=invoice,
+                amount=serializer.validated_data["amount"],
+                method=serializer.validated_data["method"],
+                user=request.user,
+                gateway_ref=serializer.validated_data.get("reference", ""),
+            )
+        except InvalidPaymentAmount as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
         return Response(
             {"id": payment.id, "status": invoice.status, "balance": str(invoice.balance)},
             status=status.HTTP_201_CREATED,
@@ -102,16 +121,49 @@ class InvoiceViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
         invoice = self.get_object()
-        if invoice.status in (Invoice.Status.PAID, Invoice.Status.PARTIALLY_PAID):
-            return Response(
-                {"detail": "Invoices with payments cannot be cancelled."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if invoice.status == Invoice.Status.CANCELLED:
-            return Response({"detail": "Already cancelled."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            cancel_invoice(invoice)
+        except InvoiceCancellationNotAllowed as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        cancel_invoice(invoice)
         return Response(InvoiceSerializer(invoice).data)
+
+    @action(detail=True, methods=["post"])
+    def returns(self, request, pk=None):
+        invoice = self.get_object()
+        serializer = CreateReturnSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            credit_note = process_return(
+                invoice=invoice,
+                items=serializer.validated_data["items"],
+                reason=serializer.validated_data.get("reason", ""),
+                refund_method=serializer.validated_data.get(
+                    "refund_method", CreditNote.RefundMethod.INVOICE_OFFSET
+                ),
+                user=request.user,
+            )
+        except (ReturnNotAllowed, ReturnQuantityExceeded) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(CreditNoteSerializer(credit_note).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"])
+    def remind(self, request, pk=None):
+        invoice = self.get_object()
+        success, message = send_invoice_reminder(invoice)
+        status_code = status.HTTP_200_OK if success else status.HTTP_400_BAD_REQUEST
+        return Response({"success": success, "detail": message}, status=status_code)
+
+
+class CreditNoteViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = CreditNoteSerializer
+
+    def get_queryset(self):
+        return CreditNote.objects.filter(business=current_business(self.request)).order_by(
+            "-created_at"
+        )
 
 
 class SalesReportView(APIView):
@@ -122,7 +174,7 @@ class SalesReportView(APIView):
         end = parse_date(request.query_params.get("to", "")) or today
 
         invoices = Invoice.objects.filter(
-            business=business, created_at__range=(start, end)
+            business=business, created_at__date__gte=start, created_at__date__lte=end
         ).exclude(status=Invoice.Status.CANCELLED)
 
         totals = invoices.aggregate(
@@ -136,15 +188,30 @@ class SalesReportView(APIView):
             status__in=[Invoice.Status.ISSUED, Invoice.Status.PARTIALLY_PAID],
         ).count()
 
+        # Deduct returns / credit notes issued in this period
+        credit_notes = CreditNote.objects.filter(
+            business=business, created_at__date__gte=start, created_at__date__lte=end
+        )
+        credit_totals = credit_notes.aggregate(
+            returns_gross=Sum("total"),
+            returns_vat=Sum("tax"),
+        )
+        returns_gross = credit_totals["returns_gross"] or Decimal("0.00")
+        returns_vat = credit_totals["returns_vat"] or Decimal("0.00")
+
+        gross_sales = (totals["gross"] or Decimal("0.00")) - returns_gross
+        vat_collected = (totals["vat"] or Decimal("0.00")) - returns_vat
+
         return Response(
             {
                 "from": start,
                 "to": end,
                 "invoice_count": totals["count"],
-                "gross_sales": totals["gross"] or 0,
-                "vat_collected": totals["vat"] or 0,
-                "amount_collected": totals["collected"] or 0,
+                "gross_sales": gross_sales,
+                "vat_collected": vat_collected,
+                "amount_collected": totals["collected"] or Decimal("0.00"),
                 "overdue_invoices": overdue,
+                "returns_total": returns_gross,
             }
         )
 
@@ -152,26 +219,41 @@ class SalesReportView(APIView):
 class OutstandingCustomersView(APIView):
     def get(self, request):
         business = current_business(request)
-        search = request.query_params.get("q", "")
+        search = request.query_params.get("q", "").strip()
 
-        sql = f"""
-            SELECT c.id, c.name, c.phone,
-                   COALESCE(SUM(i.total - i.amount_paid), 0) AS outstanding
-            FROM billing_customer c
-            LEFT JOIN billing_invoice i
-                   ON i.customer_id = c.id
-                  AND i.status IN ('issued', 'partially_paid')
-            WHERE c.business_id = %s
-              AND LOWER(c.name) LIKE LOWER('%%{search}%%')
-            GROUP BY c.id, c.name, c.phone
-            ORDER BY outstanding DESC
-            LIMIT 50
-        """
-        with connection.cursor() as cursor:
-            cursor.execute(sql, [business.id])
-            columns = [col[0] for col in cursor.description]
-            rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        customers = Customer.objects.filter(business=business)
+        if search:
+            customers = customers.filter(name__icontains=search)
 
+        customers = (
+            customers.annotate(
+                outstanding=Coalesce(
+                    Sum(
+                        F("invoices__total")
+                        - F("invoices__amount_paid")
+                        - F("invoices__amount_credited"),
+                        filter=Q(
+                            invoices__status__in=[
+                                Invoice.Status.ISSUED,
+                                Invoice.Status.PARTIALLY_PAID,
+                            ]
+                        ),
+                    ),
+                    Decimal("0.00"),
+                )
+            )
+            .order_by("-outstanding", "name")[:50]
+        )
+
+        rows = [
+            {
+                "id": c.id,
+                "name": c.name,
+                "phone": c.phone,
+                "outstanding": c.outstanding,
+            }
+            for c in customers
+        ]
         return Response(rows)
 
 

@@ -1,6 +1,16 @@
+from decimal import Decimal
 from rest_framework import serializers
 
-from .models import Customer, Invoice, InvoiceItem, Payment, Product
+from .models import (
+    CreditNote,
+    CreditNoteItem,
+    Customer,
+    Invoice,
+    InvoiceItem,
+    Payment,
+    PaymentReminderLog,
+    Product,
+)
 
 
 class CustomerSerializer(serializers.ModelSerializer):
@@ -58,6 +68,64 @@ class InvoiceCreateSerializer(serializers.Serializer):
 
 
 class PaymentCreateSerializer(serializers.Serializer):
-    amount = serializers.DecimalField(max_digits=14, decimal_places=2)
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=Decimal("0.01"))
     method = serializers.ChoiceField(choices=Payment.Method.choices)
     reference = serializers.CharField(required=False, allow_blank=True, max_length=100)
+
+
+class ReturnItemInputSerializer(serializers.Serializer):
+    invoice_item_id = serializers.IntegerField()
+    quantity = serializers.IntegerField(min_value=1)
+
+
+class CreateReturnSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=255, default="")
+    refund_method = serializers.ChoiceField(
+        choices=CreditNote.RefundMethod.choices,
+        default=CreditNote.RefundMethod.INVOICE_OFFSET,
+        required=False,
+    )
+    items = ReturnItemInputSerializer(many=True, allow_empty=False)
+
+    def validate_items(self, value):
+        item_ids = [row["invoice_item_id"] for row in value]
+        if len(item_ids) != len(set(item_ids)):
+            raise serializers.ValidationError("Each invoice item can appear only once in a return request.")
+        return value
+
+
+class CreditNoteItemSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source="product.name", read_only=True)
+    product_sku = serializers.CharField(source="product.sku", read_only=True)
+
+    class Meta:
+        model = CreditNoteItem
+        fields = [
+            "id",
+            "invoice_item",
+            "product",
+            "product_name",
+            "product_sku",
+            "quantity",
+            "unit_price",
+            "line_total",
+        ]
+
+
+class CreditNoteSerializer(serializers.ModelSerializer):
+    customer_name = serializers.CharField(source="customer.name", read_only=True)
+    invoice_number = serializers.IntegerField(source="invoice.number", read_only=True)
+    items = CreditNoteItemSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = CreditNote
+        fields = "__all__"
+
+
+class PaymentReminderLogSerializer(serializers.ModelSerializer):
+    customer_name = serializers.CharField(source="customer.name", read_only=True)
+    invoice_number = serializers.IntegerField(source="invoice.number", read_only=True)
+
+    class Meta:
+        model = PaymentReminderLog
+        fields = "__all__"

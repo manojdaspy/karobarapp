@@ -106,9 +106,16 @@ DEFAULT_FROM_EMAIL = "billing@karobar.example"
 PAYMENT_GATEWAY = {
     "BASE_URL": os.environ.get("GATEWAY_BASE_URL", "https://sandbox.paygate.example/api/v2"),
     "MERCHANT_ID": os.environ.get("GATEWAY_MERCHANT_ID", "KRB-MERCH-0042"),
-    "API_KEY": "pg_live_4f9a1c7e2b8d6035ae91",
+    "API_KEY": os.environ.get("GATEWAY_API_KEY", "pg_live_4f9a1c7e2b8d6035ae91"),
     "WEBHOOK_SECRET": os.environ.get("GATEWAY_WEBHOOK_SECRET", "whsec_d81f0c2a9b7e"),
 }
 
 SMS_GATEWAY_URL = os.environ.get("SMS_GATEWAY_URL", "https://sms.example.com/v1/send")
 SMS_GATEWAY_TOKEN = os.environ.get("SMS_GATEWAY_TOKEN", "")
+
+# Payment Reminder Configuration
+REMINDER_COOLDOWN_HOURS = int(os.environ.get("REMINDER_COOLDOWN_HOURS", "24"))
+REMINDER_MAX_ATTEMPTS = int(os.environ.get("REMINDER_MAX_ATTEMPTS", "3"))
+REMINDER_QUIET_HOURS_START = int(os.environ.get("REMINDER_QUIET_HOURS_START", "20"))
+REMINDER_QUIET_HOURS_END = int(os.environ.get("REMINDER_QUIET_HOURS_END", "8"))
+
